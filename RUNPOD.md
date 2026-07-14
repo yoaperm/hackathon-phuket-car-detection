@@ -33,6 +33,11 @@ cd /workspace/yolov8-traffic-runpod
 chmod +x run.sh
 
 # 4. Configure this run (see .env.example for all options).
+#    NOTE: models/best.pt is fine-tuned on TOP-VIEW aerial imagery. For
+#    street-view CCTV (e.g. the Phuket phuket-eye footage) use a COCO model
+#    with full-frame detection and a vehicle class filter instead:
+#      export MODEL_PATH=yolov8s.pt DISABLE_ROI=true \
+#             DETECT_CLASSES=car,motorcycle,bus,truck,bicycle CONF_THRESHOLD=0.35
 export S3_INPUT="s3://my-bucket/incoming-videos/"   # object(s) or a prefix ending in "/"
 export OUTPUT_DIR="/workspace/output"
 export AWS_ACCESS_KEY_ID="..."        # omit all three if the Pod has an IAM role

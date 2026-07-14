@@ -70,6 +70,7 @@ def _env_int(name: str, default: int) -> int:
 @dataclass
 class Config:
     s3_input: str | None
+    s3_output: str | None
     local_video_dir: str | None
     output_dir: Path
     model_path: Path
@@ -82,11 +83,14 @@ class Config:
     preview_frame_fraction: float
     disable_roi: bool
     detect_classes: list[str]
+    max_seconds: float | None
 
 
 def load_config() -> Config:
+    max_seconds_raw = os.environ.get("MAX_SECONDS")
     cfg = Config(
         s3_input=os.environ.get("S3_INPUT") or None,
+        s3_output=os.environ.get("S3_OUTPUT") or None,
         local_video_dir=os.environ.get("LOCAL_VIDEO_DIR") or None,
         output_dir=Path(os.environ.get("OUTPUT_DIR", "/workspace/output")),
         model_path=Path(os.environ.get("MODEL_PATH", "models/best.pt")),
@@ -103,6 +107,7 @@ def load_config() -> Config:
             for c in os.environ.get("DETECT_CLASSES", "").split(",")
             if c.strip()
         ],
+        max_seconds=float(max_seconds_raw) if max_seconds_raw else None,
     )
     if not cfg.s3_input and not cfg.local_video_dir:
         sys.exit(
@@ -191,6 +196,32 @@ def download_video(s3_client, uri: str, dest_dir: Path) -> Path:
     except (ClientError, BotoCoreError, NoCredentialsError) as exc:
         raise RuntimeError(f"failed to download {uri}: {exc}") from exc
     return dest
+
+
+def upload_output_to_s3(s3_client, local_dir: Path, s3_prefix: str) -> int:
+    """Upload every file under local_dir to s3_prefix, preserving the relative
+    subpath (videos/, previews/, csv/...). Skips the _staging dir (downloaded
+    source videos, not a result). Per-file failures are logged and skipped —
+    a partial upload still leaves the already-saved local OUTPUT_DIR intact.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
+
+    parsed = urlparse(s3_prefix)
+    bucket, prefix = parsed.netloc, parsed.path.lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+
+    uploaded = 0
+    for file_path in sorted(local_dir.rglob("*")):
+        if not file_path.is_file() or "_staging" in file_path.relative_to(local_dir).parts:
+            continue
+        rel_key = prefix + file_path.relative_to(local_dir).as_posix()
+        try:
+            s3_client.upload_file(str(file_path), bucket, rel_key)
+            uploaded += 1
+        except (ClientError, BotoCoreError, NoCredentialsError) as exc:
+            print(f"WARNING: failed to upload {file_path} -> s3://{bucket}/{rel_key}: {exc}", file=sys.stderr)
+    return uploaded
 
 
 # ---------------------------------------------------------------------------
@@ -298,13 +329,18 @@ def process_video(
         if not writer.isOpened():
             raise RuntimeError(f"could not open VideoWriter for {out_video_path}")
 
+    max_frames = int(cfg.max_seconds * fps) if cfg.max_seconds else None
+    effective_total = min(total_frames, max_frames) if max_frames and total_frames > 0 else total_frames
+
     preview_path = str(cfg.output_dir / "previews" / f"{stem}_preview.jpg")
-    preview_target = int(total_frames * cfg.preview_frame_fraction) if total_frames > 0 else 0
+    preview_target = int(effective_total * cfg.preview_frame_fraction) if effective_total > 0 else 0
     preview_saved = False
 
     records: list[dict] = []
     frame_idx = 0
     while True:
+        if max_frames is not None and frame_idx >= max_frames:
+            break
         ret, frame = cap.read()
         if not ret:
             break
@@ -471,6 +507,11 @@ def main() -> None:
 
     if not summary_rows:
         sys.exit("ERROR: no videos processed successfully.")
+
+    if cfg.s3_output:
+        s3_out = get_s3_client()
+        uploaded = upload_output_to_s3(s3_out, cfg.output_dir, cfg.s3_output)
+        print(f"Uploaded {uploaded} file(s) to {cfg.s3_output}")
 
     print(f"Done. Results in {cfg.output_dir}")
 

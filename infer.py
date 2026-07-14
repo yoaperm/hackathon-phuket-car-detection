@@ -80,9 +80,11 @@ class Config:
     allow_cpu: bool
     save_annotated_video: bool
     preview_frame_fraction: float
+    max_seconds: float | None
 
 
 def load_config() -> Config:
+    max_seconds_raw = os.environ.get("MAX_SECONDS")
     cfg = Config(
         s3_input=os.environ.get("S3_INPUT") or None,
         local_video_dir=os.environ.get("LOCAL_VIDEO_DIR") or None,
@@ -95,6 +97,7 @@ def load_config() -> Config:
         allow_cpu=_env_bool("ALLOW_CPU", False),
         save_annotated_video=_env_bool("SAVE_ANNOTATED_VIDEO", True),
         preview_frame_fraction=_env_float("PREVIEW_FRAME_FRACTION", 0.5),
+        max_seconds=float(max_seconds_raw) if max_seconds_raw else None,
     )
     if not cfg.s3_input and not cfg.local_video_dir:
         sys.exit(
@@ -279,13 +282,18 @@ def process_video(model, video_path: Path, cfg: Config, device: str, s3_uri: str
         if not writer.isOpened():
             raise RuntimeError(f"could not open VideoWriter for {out_video_path}")
 
+    max_frames = int(cfg.max_seconds * fps) if cfg.max_seconds else None
+    effective_total = min(total_frames, max_frames) if max_frames and total_frames > 0 else total_frames
+
     preview_path = str(cfg.output_dir / "previews" / f"{stem}_preview.jpg")
-    preview_target = int(total_frames * cfg.preview_frame_fraction) if total_frames > 0 else 0
+    preview_target = int(effective_total * cfg.preview_frame_fraction) if effective_total > 0 else 0
     preview_saved = False
 
     records: list[dict] = []
     frame_idx = 0
     while True:
+        if max_frames is not None and frame_idx >= max_frames:
+            break
         ret, frame = cap.read()
         if not ret:
             break

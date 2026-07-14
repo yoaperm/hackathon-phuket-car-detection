@@ -1,0 +1,15 @@
+# Python dependencies for the RunPod batch inference job (infer.py).
+#
+# torch / torchvision are intentionally NOT listed: RunPod's official PyTorch/CUDA
+# base images already ship a CUDA-matched build. Installing torch here risks pulling
+# a mismatched CUDA wheel and silently breaking GPU support. Launch from a template
+# that already includes PyTorch + CUDA (e.g. runpod/pytorch:2.x-cuda...).
+#
+# opencv-python-headless (not opencv-python): a RunPod Pod reached over SSH has no
+# X server, so cv2.imshow cannot render regardless of ENABLE_GUI. If you need a real
+# preview window for LOCAL debugging, swap this line for `opencv-python`.
+ultralytics>=8.1,<9
+opencv-python-headless>=4.9,<5
+boto3>=1.34,<2
+pandas>=2.0,<3
+numpy>=1.24,<2

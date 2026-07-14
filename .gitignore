@@ -1,0 +1,12 @@
+# Generated output and local runtime artifacts
+output/
+_staging/
+*.log
+
+# Local environment / secrets (never commit real credentials)
+.env
+.venv/
+
+# Python bytecode caches
+__pycache__/
+*.pyc

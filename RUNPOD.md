@@ -71,11 +71,16 @@ csv/<name>_frame_counts.csv     per-frame: frame_index, timestamp_sec, left/righ
 csv/summary.csv                 one row per video: averages, maxima, % heavy, output paths, device_used
 ```
 
+Optionally, set `S3_OUTPUT=s3://my-bucket/results/run1/` to also upload everything
+under `OUTPUT_DIR` (videos/, previews/, csv/ — not the `_staging/` downloads) to
+that S3 prefix after processing finishes. Off by default (local-only).
+
 ## Environment variables
 
 See [`.env.example`](.env.example) for the full list with defaults. Key ones:
-`S3_INPUT` / `LOCAL_VIDEO_DIR` (input), `OUTPUT_DIR`, `MODEL_PATH`,
-`CONF_THRESHOLD`, `HEAVY_TRAFFIC_THRESHOLD`, `ENABLE_GUI`, `ALLOW_CPU`.
+`S3_INPUT` / `LOCAL_VIDEO_DIR` (input), `S3_OUTPUT` (optional upload of results),
+`OUTPUT_DIR`, `MODEL_PATH`, `CONF_THRESHOLD`, `HEAVY_TRAFFIC_THRESHOLD`,
+`ENABLE_GUI`, `ALLOW_CPU`, `MAX_SECONDS`.
 
 ## Known limitations
 

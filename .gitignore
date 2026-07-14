@@ -10,3 +10,8 @@ _staging/
 # Python bytecode caches
 __pycache__/
 *.pyc
+
+# Demo/alternate output dirs and auto-downloaded COCO weights
+output-coco/
+demo-output/
+yolov8*.pt

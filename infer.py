@@ -80,6 +80,8 @@ class Config:
     allow_cpu: bool
     save_annotated_video: bool
     preview_frame_fraction: float
+    disable_roi: bool
+    detect_classes: list[str]
 
 
 def load_config() -> Config:
@@ -95,6 +97,12 @@ def load_config() -> Config:
         allow_cpu=_env_bool("ALLOW_CPU", False),
         save_annotated_video=_env_bool("SAVE_ANNOTATED_VIDEO", True),
         preview_frame_fraction=_env_float("PREVIEW_FRAME_FRACTION", 0.5),
+        disable_roi=_env_bool("DISABLE_ROI", False),
+        detect_classes=[
+            c.strip().lower()
+            for c in os.environ.get("DETECT_CLASSES", "").split(",")
+            if c.strip()
+        ],
     )
     if not cfg.s3_input and not cfg.local_video_dir:
         sys.exit(
@@ -106,7 +114,10 @@ def load_config() -> Config:
             "WARNING: both S3_INPUT and LOCAL_VIDEO_DIR are set; using S3_INPUT.",
             file=sys.stderr,
         )
-    if not cfg.model_path.is_file():
+    # Bare well-known names (e.g. "yolov8s.pt", no directory part) are handed to
+    # ultralytics as-is, which auto-downloads them; only real paths must exist.
+    is_bare_name = cfg.model_path.name == str(cfg.model_path)
+    if not is_bare_name and not cfg.model_path.is_file():
         sys.exit(f"ERROR: model weights not found at {cfg.model_path}")
     return cfg
 
@@ -236,9 +247,10 @@ def _draw_label(frame, text, position, scale, background_color):
     cv2.putText(frame, text, (x, y), FONT, font_scale, FONT_COLOR, thickness, cv2.LINE_AA)
 
 
-def annotate_frame(frame, roi: RoiParams, left, right, status_left, status_right):
-    cv2.polylines(frame, [roi.vertices1], isClosed=True, color=(0, 255, 0), thickness=2)
-    cv2.polylines(frame, [roi.vertices2], isClosed=True, color=(255, 0, 0), thickness=2)
+def annotate_frame(frame, roi: RoiParams, left, right, status_left, status_right, draw_lanes=True):
+    if draw_lanes:
+        cv2.polylines(frame, [roi.vertices1], isClosed=True, color=(0, 255, 0), thickness=2)
+        cv2.polylines(frame, [roi.vertices2], isClosed=True, color=(255, 0, 0), thickness=2)
 
     scale = max(0.5, min(roi.scale_x, roi.scale_y))
     left_x = int(round(10 * roi.scale_x))
@@ -255,7 +267,14 @@ def annotate_frame(frame, roi: RoiParams, left, right, status_left, status_right
 # ---------------------------------------------------------------------------
 # Per-video processing
 # ---------------------------------------------------------------------------
-def process_video(model, video_path: Path, cfg: Config, device: str, s3_uri: str | None) -> dict:
+def process_video(
+    model,
+    video_path: Path,
+    cfg: Config,
+    device: str,
+    s3_uri: str | None,
+    class_ids: list[int] | None = None,
+) -> dict:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"could not open video {video_path}")
@@ -290,29 +309,37 @@ def process_video(model, video_path: Path, cfg: Config, device: str, s3_uri: str
         if not ret:
             break
 
-        detection_frame = frame.copy()
-        detection_frame[: roi.row_start, :] = 0
-        detection_frame[roi.row_end :, :] = 0
+        if cfg.disable_roi:
+            detection_frame = frame
+        else:
+            detection_frame = frame.copy()
+            detection_frame[: roi.row_start, :] = 0
+            detection_frame[roi.row_end :, :] = 0
 
         results = model.predict(
             detection_frame,
             imgsz=cfg.img_size,
             conf=cfg.conf_threshold,
             device=device,
+            classes=class_ids,
             verbose=False,
         )
         processed = results[0].plot(line_width=1)
 
-        # Restore the masked-out regions from the original frame for display.
-        processed[: roi.row_start, :] = frame[: roi.row_start, :]
-        processed[roi.row_end :, :] = frame[roi.row_end :, :]
+        if not cfg.disable_roi:
+            # Restore the masked-out regions from the original frame for display.
+            processed[: roi.row_start, :] = frame[: roi.row_start, :]
+            processed[roi.row_end :, :] = frame[roi.row_end :, :]
 
         boxes = results[0].boxes.xyxy.cpu().numpy()
         left, right = count_vehicles_by_lane(boxes, roi.lane_split_x)
         status_left = "Heavy" if left > cfg.heavy_traffic_threshold else "Smooth"
         status_right = "Heavy" if right > cfg.heavy_traffic_threshold else "Smooth"
 
-        annotate_frame(processed, roi, left, right, status_left, status_right)
+        annotate_frame(
+            processed, roi, left, right, status_left, status_right,
+            draw_lanes=not cfg.disable_roi,
+        )
 
         records.append(
             {
@@ -412,13 +439,25 @@ def main() -> None:
     print(f"Loading model from {cfg.model_path}")
     model = YOLO(str(cfg.model_path))
 
+    class_ids: list[int] | None = None
+    if cfg.detect_classes:
+        name_to_id = {str(v).lower(): int(k) for k, v in model.names.items()}
+        unknown = [c for c in cfg.detect_classes if c not in name_to_id]
+        if unknown:
+            sys.exit(
+                f"ERROR: DETECT_CLASSES names not in model: {unknown}. "
+                f"Model classes: {sorted(name_to_id)}"
+            )
+        class_ids = [name_to_id[c] for c in cfg.detect_classes]
+        print(f"Filtering detections to classes: {cfg.detect_classes} -> ids {class_ids}")
+
     inputs = resolve_inputs(cfg, cfg.output_dir / "_staging")
     print(f"Processing {len(inputs)} video(s)...")
 
     summary_rows: list[dict] = []
     for local_path, s3_uri in inputs:
         try:
-            row = process_video(model, local_path, cfg, device, s3_uri)
+            row = process_video(model, local_path, cfg, device, s3_uri, class_ids)
             summary_rows.append(row)
             print(f"[OK] {local_path.name}: {row['total_frames']} frames")
         except Exception as exc:  # noqa: BLE001 - batch keeps going on per-video failure

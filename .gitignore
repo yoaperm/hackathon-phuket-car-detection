@@ -15,3 +15,5 @@ __pycache__/
 output-coco/
 demo-output/
 yolov8*.pt
+analytics-out/
+yolo11*.pt

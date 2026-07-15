@@ -13,3 +13,7 @@ opencv-python-headless>=4.9,<5
 boto3>=1.34,<2
 pandas>=2.0,<3
 numpy>=1.24,<2
+# Tracking (track_analytics.py): ByteTrack linear assignment
+lap>=0.5.12
+# Required to unpickle the fine-tuned models/best.pt checkpoint
+dill

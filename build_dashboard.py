@@ -27,7 +27,9 @@ CAMERA_LABELS = {
     "chalong_c1_0700_demo30s": ("Chalong C1", "07:00 · morning rain"),
     "chalong_c1_2200_demo20s": ("Chalong C1", "22:00 · night"),
     "kathu_c10_1200_demo20s": ("Kathu C10", "12:00 · intersection"),
+    "kathu_c10_2100_demo20s": ("Kathu C10", "21:00 · night"),
     "sakhu_c1_0800_demo20s": ("Sakhu C1", "08:00 · morning"),
+    "sakhu_c1_1400_demo20s": ("Sakhu C1", "14:00 · afternoon"),
 }
 
 

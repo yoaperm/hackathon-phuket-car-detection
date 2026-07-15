@@ -17,3 +17,7 @@ demo-output/
 yolov8*.pt
 analytics-out/
 yolo11*.pt
+
+# Fine-tuning data and training runs (regenerate with finetune/ scripts)
+data/
+runs/

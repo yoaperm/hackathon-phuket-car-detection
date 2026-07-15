@@ -29,7 +29,17 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-VEHICLE_CLASSES = {1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+VEHICLE_NAMES = {"bicycle", "car", "motorcycle", "bus", "truck"}
+
+
+def vehicle_classes(model):
+    """Map class id -> name for the vehicle classes of THIS model.
+
+    COCO checkpoints carry 80 classes (car=2, ...); the fine-tuned Phuket
+    checkpoints carry 5 remapped ones (car=0, ...). Reading model.names keeps
+    the id filter correct for both.
+    """
+    return {i: n for i, n in model.names.items() if n in VEHICLE_NAMES}
 COLORS = {"car": (0, 220, 0), "motorcycle": (255, 140, 0), "bus": (0, 165, 255),
           "truck": (0, 0, 230), "bicycle": (230, 0, 230)}
 # Congestion thresholds on the rolling mean of simultaneously-tracked vehicles.
@@ -82,6 +92,7 @@ def main():
     line_b = (int(fx[2] * out_w), int(fx[3] * out_h))
 
     model = YOLO(a.model)
+    classes = vehicle_classes(model)
     out_mp4 = os.path.join(a.out_dir, f"{stem}_tracked.mp4")
     writer = cv2.VideoWriter(out_mp4, cv2.VideoWriter_fourcc(*"mp4v"),
                              src_fps, (out_w, out_h))
@@ -106,7 +117,7 @@ def main():
         frame = cv2.resize(frame, (out_w, out_h))
 
         r = model.track(frame, persist=True, tracker=a.tracker,
-                        classes=list(VEHICLE_CLASSES), conf=a.conf,
+                        classes=list(classes), conf=a.conf,
                         imgsz=a.imgsz, verbose=False)[0]
 
         active = 0
@@ -117,7 +128,7 @@ def main():
             boxes = r.boxes.xyxy.int().tolist()
             active = len(ids)
             for tid, cls, cf, (x1, y1, x2, y2) in zip(ids, clss, confs, boxes):
-                name = VEHICLE_CLASSES[cls]
+                name = classes[cls]
                 if tid not in seen_ids:
                     seen_ids.add(tid)
                     unique_by_class[name] += 1

@@ -32,6 +32,8 @@ pip -q install "ultralytics>=8.1,<9" || fail "pip install ultralytics"
 echo "== fetching dataset"
 aws s3 cp "$DATASET" - | tar xz --no-same-owner --exclude '._*' || fail "dataset download"
 [ -f phuket-yolo/dataset.yaml ] || fail "dataset.yaml missing after extract"
+# dataset.yaml carries the absolute path of the machine that built it — repoint it here
+sed -i "s|^path:.*|path: $(pwd)/phuket-yolo|" phuket-yolo/dataset.yaml
 
 echo "== training"
 python3 - <<'EOF' || fail "training crashed"

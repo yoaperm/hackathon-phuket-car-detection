@@ -94,8 +94,12 @@ def main():
     model = YOLO(a.model)
     classes = vehicle_classes(model)
     out_mp4 = os.path.join(a.out_dir, f"{stem}_tracked.mp4")
-    writer = cv2.VideoWriter(out_mp4, cv2.VideoWriter_fourcc(*"mp4v"),
+    # avc1 (H.264) plays in browsers; mp4v does not. Fall back if unavailable.
+    writer = cv2.VideoWriter(out_mp4, cv2.VideoWriter_fourcc(*"avc1"),
                              src_fps, (out_w, out_h))
+    if not writer.isOpened():
+        writer = cv2.VideoWriter(out_mp4, cv2.VideoWriter_fourcc(*"mp4v"),
+                                 src_fps, (out_w, out_h))
 
     trails = defaultdict(lambda: deque(maxlen=30))   # track id -> recent centers
     last_side = {}                                    # track id -> last line side

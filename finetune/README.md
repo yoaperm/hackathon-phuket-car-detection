@@ -41,12 +41,40 @@ S3 CCTV clips ──> build_dataset.py ──> data/phuket-yolo/ ──> train_p
    `MODEL_PATH=models/phuket-yolo11s.pt` for `infer.py`, or
    `--model runs/detect/phuket-finetune/weights/best.pt` for `track_analytics.py`.
 
-## Pilot result (2026-07-15, M4 Pro CPU)
+## Staged dataset: phuket-yolo-v1 (2026-07-15)
 
-70 train / 20 val frames from 4 clips, YOLO11l teacher @1920, YOLO11n student
-@640 for 20 epochs: val mAP50 0.000 → **0.123** (car 0.308) on a **held-out
-camera** (Sakhu). This only proves the loop learns — the GPU config above
-(yolo11s @1280, more clips, more epochs) is where real accuracy comes from.
+Ready-to-train dataset on S3 — no need to rebuild it on the GPU box:
+
+- `s3://chula-aigov-car-video-training-487984284636/datasets/phuket-yolo-v1.tar.gz` (334 MB)
+- 310 train / 89 val frames from **15 clips / 12 distinct cameras**, all 3 locations,
+  timebands 00:00–23:00 (incl. two night cameras and one 2688×1520@15fps HEVC unit)
+- 4,702 YOLO11l auto-labeled boxes: 2,791 car / 1,333 motorcycle / 499 truck / 70 bus / 9 bicycle
+- Val = 3 cameras that appear nowhere in train (Chalong C13 night, Kathu C12 day,
+  Sakhu C15 day) — measures unseen-viewpoint generalization, the deployment scenario.
+
+On the GPU box (RunPod pod or EC2 g4dn once quota clears), the whole run is:
+
+```bash
+aws s3 cp s3://chula-aigov-car-video-training-487984284636/datasets/phuket-yolo-v1.tar.gz - | tar xz
+python3 finetune/train_phuket.py --data phuket-yolo/dataset.yaml \
+    --model yolo11s.pt --epochs 40 --imgsz 1280 --batch 8 \
+    --out-s3 s3://chula-aigov-car-video-training-487984284636/models/phuket-yolo11s/
+```
+
+To grow the dataset: `finetune/cut_clips.py` cuts new clips from any S3 recording
+via byte-range head fetch, then re-run `build_dataset.py`.
+
+## Pilot results (2026-07-15, M4 Pro CPU, YOLO11n @640, 20 epochs)
+
+| Dataset | Val setup | val mAP50 | mAP50-95 |
+|---|---|---|---|
+| 4 clips, 70 train frames | 1 held-out camera | 0.123 | 0.059 |
+| **v1: 15 clips, 310 train frames** | 3 unseen cameras incl. night | **0.280** | **0.167** |
+
+Scaling the dataset 4.4× more than doubled unseen-camera accuracy with the same
+tiny student — the in-domain-data lever from the research doc, observed directly.
+These pilots only prove the loop; the GPU config above (yolo11s @1280, 40 epochs)
+is where real accuracy comes from.
 
 ## Scaling up the dataset
 

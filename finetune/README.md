@@ -73,8 +73,27 @@ via byte-range head fetch, then re-run `build_dataset.py`.
 
 Scaling the dataset 4.4× more than doubled unseen-camera accuracy with the same
 tiny student — the in-domain-data lever from the research doc, observed directly.
-These pilots only prove the loop; the GPU config above (yolo11s @1280, 40 epochs)
-is where real accuracy comes from.
+
+## GPU result: phuket-yolo11s (2026-07-15, RunPod RTX 3090)
+
+The real run — YOLO11s @1280, 40 epochs on phuket-yolo-v1 via `runpod_job.sh`
+(unattended pod, auto-terminated; ~$0.15 of GPU time):
+
+| Metric | val (3 unseen cameras, incl. night) |
+|---|---|
+| mAP50 | **0.702** |
+| mAP50-95 | **0.509** (car 0.654, motorcycle 0.423, truck 0.449) |
+
+Weights: `models/phuket-yolo11s.pt` (also
+`s3://chula-aigov-car-video-training-487984284636/models/phuket-yolo11s/best.pt`,
+with training curves, confusion matrix, and the full job log alongside).
+Use with `MODEL_PATH=models/phuket-yolo11s.pt` (infer.py) or
+`--model models/phuket-yolo11s.pt` (track_analytics.py). Note the model predicts
+the 5 remapped classes (car/motorcycle/bus/truck/bicycle), not COCO ids.
+
+Caveat: val labels are teacher-generated (YOLO11l @1920), so this measures
+agreement with the teacher on unseen cameras, not human ground truth. A small
+human-labeled test set is the next rigor upgrade.
 
 ## Scaling up the dataset
 

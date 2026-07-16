@@ -52,6 +52,24 @@ def side_of_line(pt, a, b):
     return np.sign((b[0] - a[0]) * (pt[1] - a[1]) - (b[1] - a[1]) * (pt[0] - a[0]))
 
 
+def resolve_line(spec: str, stem: str) -> list[float]:
+    """'auto' -> longest camera_lines.json prefix match for this clip stem;
+    otherwise parse the explicit x1,y1,x2,y2 fractions."""
+    if spec != "auto":
+        return [float(v) for v in spec.split(",")]
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "camera_lines.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            table = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
+        best = max((k for k in table if stem.startswith(k)), key=len, default=None)
+        if best:
+            print(f"counting line from camera_lines.json[{best}]: {table[best]}")
+            return table[best]
+    print("no per-camera line found; using horizontal default")
+    return [0, 0.55, 1, 0.55]
+
+
 def congestion_state(mean_active: float) -> str:
     for threshold, name in CONGESTION_LEVELS:
         if mean_active <= threshold:
@@ -68,10 +86,14 @@ def main():
     ap.add_argument("--imgsz", type=int, default=960)
     ap.add_argument("--seconds", type=float, default=0, help="0 = whole video")
     ap.add_argument("--scale", type=int, default=1280, help="processing/output width")
-    ap.add_argument("--line", default="0,0.55,1,0.55",
-                    help="counting line as x1,y1,x2,y2 fractions of the frame")
+    ap.add_argument("--line", default="auto",
+                    help="counting line as x1,y1,x2,y2 fractions of the frame; "
+                         "'auto' resolves per camera from camera_lines.json")
     ap.add_argument("--tracker", default="bytetrack.yaml",
                     help="ultralytics tracker config (bytetrack.yaml or botsort.yaml)")
+    ap.add_argument("--stationary-secs", type=float, default=8.0,
+                    help="a track this old that has not moved is flagged stationary "
+                         "(0 disables the stationary/obstruction detector)")
     a = ap.parse_args()
 
     os.makedirs(a.out_dir, exist_ok=True)
@@ -87,9 +109,22 @@ def main():
     out_h = int(h * out_w / w) // 2 * 2
     max_frames = int(a.seconds * src_fps) if a.seconds else None
 
-    fx = [float(v) for v in a.line.split(",")]
+    fx = resolve_line(a.line, stem)
     line_a = (int(fx[0] * out_w), int(fx[1] * out_h))
     line_b = (int(fx[2] * out_w), int(fx[3] * out_h))
+
+    # Stationary/obstruction detector: a track older than --stationary-secs
+    # whose center stayed within STATIONARY_RADIUS of where it was back then is
+    # flagged (parked or stopped in/near the roadway). Camera-relative pixels —
+    # no homography, so this is a per-view heuristic, not metric displacement.
+    stat_window = int(a.stationary_secs * src_fps)
+    STATIONARY_RADIUS = 0.015 * out_w           # ~19 px at 1280
+    RELEASE_RADIUS = 2.5 * STATIONARY_RADIUS    # hysteresis so flags don't flicker
+    positions = defaultdict(lambda: deque(maxlen=max(stat_window + 1, 2)))
+    stationary_now = set()      # track ids currently flagged
+    stationary_ever = set()     # unique flagged tracks (reported total)
+    stationary_since = {}       # track id -> timestamp first flagged
+    events = []                 # obstruction alerts (consumed by dashboards)
 
     model = YOLO(a.model)
     classes = vehicle_classes(model)
@@ -140,6 +175,33 @@ def main():
                 center = ((x1 + x2) // 2, (y1 + y2) // 2)
                 trails[tid].append(center)
 
+                t_now = frame_idx / src_fps
+                pos = positions[tid]
+                pos.append((frame_idx, center))
+                if a.stationary_secs > 0 and len(pos) > 1:
+                    oldest_frame, oldest_c = pos[0]
+                    span_ok = frame_idx - oldest_frame >= stat_window * 0.9
+                    moved = ((center[0] - oldest_c[0]) ** 2
+                             + (center[1] - oldest_c[1]) ** 2) ** 0.5
+                    if span_ok and moved < STATIONARY_RADIUS \
+                            and tid not in stationary_now:
+                        stationary_now.add(tid)
+                        stationary_since[tid] = t_now
+                        if tid not in stationary_ever:
+                            stationary_ever.add(tid)
+                            events.append({
+                                "t": round(t_now, 1), "type": "obstruction",
+                                "severity": "alert",
+                                "msg": f"Stationary {name} #{tid} — no movement "
+                                       f"for {a.stationary_secs:.0f}s+"})
+                    elif tid in stationary_now and moved > RELEASE_RADIUS:
+                        stationary_now.discard(tid)
+                        events.append({
+                            "t": round(t_now, 1), "type": "obstruction",
+                            "severity": "info",
+                            "msg": f"{name} #{tid} moving again after "
+                                   f"{t_now - stationary_since.get(tid, t_now):.0f}s stationary"})
+
                 side = side_of_line(center, line_a, line_b)
                 prev = last_side.get(tid)
                 if prev is not None and side != 0 and prev != 0 and side != prev \
@@ -150,6 +212,12 @@ def main():
                     last_side[tid] = side
 
                 c = COLORS[name]
+                if tid in stationary_now:
+                    c = (0, 0, 255)
+                    dwell = frame_idx / src_fps - stationary_since.get(tid, 0)
+                    cv2.rectangle(frame, (x1 - 3, y1 - 3), (x2 + 3, y2 + 3), c, 3)
+                    cv2.putText(frame, f"STATIONARY {dwell:.0f}s", (x1, y2 + 16),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 2, cv2.LINE_AA)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), c, 2)
                 label = f"#{tid} {name} {cf:.2f}"
                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
@@ -166,7 +234,8 @@ def main():
 
         cv2.line(frame, line_a, line_b, (255, 255, 0), 2)
         hud1 = (f"active:{active}  unique:{len(seen_ids)}  "
-                f"flow A>B:{flow['a_to_b']} B>A:{flow['b_to_a']}")
+                f"flow A>B:{flow['a_to_b']} B>A:{flow['b_to_a']}  "
+                f"stationary:{len(stationary_now)}")
         hud2 = f"congestion: {state} (5s avg {mean_active:.1f})"
         cv2.rectangle(frame, (0, 0), (out_w, 46), (0, 0, 0), -1)
         cv2.putText(frame, hud1, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
@@ -181,6 +250,7 @@ def main():
                      "unique_total": len(seen_ids),
                      "flow_a_to_b": flow["a_to_b"],
                      "flow_b_to_a": flow["b_to_a"],
+                     "stationary_active": len(stationary_now),
                      "congestion": state})
         frame_idx += 1
         if frame_idx % 100 == 0:
@@ -200,6 +270,11 @@ def main():
         "unique_vehicles_by_class": dict(unique_by_class),
         "line_crossings": {"a_to_b": flow["a_to_b"], "b_to_a": flow["b_to_a"],
                            "by_class": dict(flow_by_class)},
+        "counting_line": fx,
+        "stationary_vehicles_total": len(stationary_ever),
+        "stationary_by_class": dict(Counter(
+            track_class[tid] for tid in stationary_ever if tid in track_class)),
+        "events": events,
         "congestion_final": rows[-1]["congestion"] if rows else "n/a",
         "congestion_share": {s: round(sum(r["congestion"] == s for r in rows)
                                       / max(len(rows), 1), 3)

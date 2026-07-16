@@ -14,7 +14,9 @@ set -uo pipefail
 
 BUCKET=chula-aigov-car-video-training-487984284636
 DATASET=s3://$BUCKET/datasets/phuket-yolo-v1.tar.gz
-OUT=s3://$BUCKET/models/phuket-yolo11s
+STUDENT="${STUDENT:-yolo11s.pt}"
+RUN_NAME="${RUN_NAME:-phuket-yolo11s}"
+OUT=s3://$BUCKET/models/$RUN_NAME
 export AWS_DEFAULT_REGION=ap-southeast-1
 
 fail() {
@@ -40,9 +42,10 @@ python3 - <<'EOF' || fail "training crashed"
 import shutil
 from ultralytics import YOLO
 
-model = YOLO("yolo11s.pt")
+import os
+model = YOLO(os.environ.get("STUDENT", "yolo11s.pt"))
 results = model.train(data="phuket-yolo/dataset.yaml", epochs=40, imgsz=1280,
-                      batch=8, freeze=10, device=0, name="phuket-yolo11s",
+                      batch=8, freeze=10, device=0, name=os.environ.get("RUN_NAME", "phuket-yolo11s"),
                       patience=10, plots=True, exist_ok=True)
 metrics = model.val(data="phuket-yolo/dataset.yaml", imgsz=1280, device=0)
 print(f"FINAL mAP50={metrics.box.map50:.4f} mAP50-95={metrics.box.map:.4f}")
@@ -58,8 +61,8 @@ echo "== uploading results"
 aws s3 cp best.pt "$OUT/best.pt" || fail "upload best.pt"
 aws s3 cp results.csv "$OUT/results.csv" || true
 aws s3 cp metrics.txt "$OUT/metrics.txt" || true
-aws s3 cp runs/detect/phuket-yolo11s/confusion_matrix_normalized.png "$OUT/confusion_matrix.png" || true
-aws s3 cp runs/detect/phuket-yolo11s/results.png "$OUT/curves.png" || true
+aws s3 cp runs/detect/$RUN_NAME/confusion_matrix_normalized.png "$OUT/confusion_matrix.png" || true
+aws s3 cp runs/detect/$RUN_NAME/results.png "$OUT/curves.png" || true
 
 cat metrics.txt | aws s3 cp - "$OUT/_DONE" || fail "write _DONE"
 echo "== JOB COMPLETE"

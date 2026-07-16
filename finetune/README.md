@@ -95,6 +95,19 @@ Caveat: val labels are teacher-generated (YOLO11l @1920), so this measures
 agreement with the teacher on unseen cameras, not human ground truth. A small
 human-labeled test set is the next rigor upgrade.
 
+## YOLO26 comparison (2026-07-16, same recipe/data/GPU class)
+
+| Student | val mAP50 | val mAP50-95 | car | motorcycle | truck | CPU ms/frame @1280 |
+|---|---|---|---|---|---|---|
+| yolo11s fine-tune | 0.702 | 0.509 | 0.654 | 0.423 | 0.449 | 230 |
+| **yolo26s fine-tune** | **0.722** | **0.552** | 0.689 | 0.459 | 0.509 | 250 |
+
+YOLO26s (end-to-end, NMS-free) wins every class at near-identical size —
+**+8.5% relative mAP50-95** — for ~9% slower CPU inference in this setup.
+Adopted as the default: `models/phuket-yolo26s.pt`
+(S3: `models/phuket-yolo26s/best.pt`). Train any student via
+`STUDENT=yolo26s.pt RUN_NAME=phuket-yolo26s` env on `runpod_job.sh`.
+
 ## Scaling up the dataset
 
 - More clips → more diversity. Cut 20 s clips from any S3 source with a byte-range

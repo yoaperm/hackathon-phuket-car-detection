@@ -94,6 +94,12 @@ def main():
     ap.add_argument("--stationary-secs", type=float, default=8.0,
                     help="a track this old that has not moved is flagged stationary "
                          "(0 disables the stationary/obstruction detector)")
+    ap.add_argument("--incident-stop-secs", type=float, default=3.0,
+                    help="a previously-moving vehicle stopped this long fires an "
+                         "incident-signature event")
+    ap.add_argument("--incident-move-speed", type=float, default=0.025,
+                    help="fraction of frame width per second that counts as "
+                         "'was driving' for the incident detector")
     a = ap.parse_args()
 
     os.makedirs(a.out_dir, exist_ok=True)
@@ -124,7 +130,20 @@ def main():
     stationary_now = set()      # track ids currently flagged
     stationary_ever = set()     # unique flagged tracks (reported total)
     stationary_since = {}       # track id -> timestamp first flagged
-    events = []                 # obstruction alerts (consumed by dashboards)
+    events = []                 # obstruction/incident alerts (consumed by dashboards)
+
+    # Incident signatures: a vehicle that WAS moving comes to a sudden stop in
+    # the roadway. Rule-based on real tracks — indicative, not a verified
+    # accident (signal stops also match; the copy says so). Escalates when
+    # several vehicles stop near each other within a short window.
+    MOVE_SPEED = a.incident_move_speed * out_w   # px/s that counts as "was driving"
+    STOP_SPEED = 0.006 * out_w        # px/s below which the vehicle is stopped
+    STOP_PERSIST_S = a.incident_stop_secs        # stay stopped this long to fire
+    CLUSTER_PX = 0.10 * out_w         # nearby-stop distance for escalation
+    peak_speed = defaultdict(float)   # track id -> lifetime peak speed (px/s)
+    stop_frames = Counter()           # track id -> consecutive stopped frames
+    incident_fired = {}               # track id -> (t, center) of its incident
+    incidents_total = 0
 
     model = YOLO(a.model)
     classes = vehicle_classes(model)
@@ -178,6 +197,40 @@ def main():
                 t_now = frame_idx / src_fps
                 pos = positions[tid]
                 pos.append((frame_idx, center))
+
+                # ~1s-lookback speed for the incident detector
+                if a.stationary_secs > 0:
+                    ref = next((p for p in pos
+                                if p[0] >= frame_idx - int(src_fps)), pos[0])
+                    span_s = max((frame_idx - ref[0]) / src_fps, 1e-6)
+                    if frame_idx - ref[0] >= int(src_fps * 0.6):
+                        speed = ((center[0] - ref[1][0]) ** 2
+                                 + (center[1] - ref[1][1]) ** 2) ** 0.5 / span_s
+                        peak_speed[tid] = max(peak_speed[tid], speed)
+                        stop_frames[tid] = stop_frames[tid] + 1 \
+                            if speed < STOP_SPEED else 0
+                        if (tid not in incident_fired
+                                and peak_speed[tid] >= MOVE_SPEED
+                                and stop_frames[tid] >= STOP_PERSIST_S * src_fps):
+                            incident_fired[tid] = (t_now, center)
+                            incidents_total += 1
+                            near = [o for o, (ot, oc) in incident_fired.items()
+                                    if o != tid and t_now - ot <= 10
+                                    and ((center[0] - oc[0]) ** 2
+                                         + (center[1] - oc[1]) ** 2) ** 0.5 <= CLUSTER_PX]
+                            events.append({
+                                "t": round(t_now, 1), "type": "incident",
+                                "severity": "emergency",
+                                "msg": f"Sudden stop in roadway — {name} #{tid} was "
+                                       f"moving, now stopped {STOP_PERSIST_S:.0f}s+ "
+                                       "(possible incident or signal stop)"})
+                            if near:
+                                events.append({
+                                    "t": round(t_now, 1), "type": "incident",
+                                    "severity": "emergency",
+                                    "msg": f"{len(near) + 1} vehicles stopped together "
+                                           "near the same spot — possible collision "
+                                           "or blockage"})
                 if a.stationary_secs > 0 and len(pos) > 1:
                     oldest_frame, oldest_c = pos[0]
                     span_ok = frame_idx - oldest_frame >= stat_window * 0.9
@@ -212,6 +265,14 @@ def main():
                     last_side[tid] = side
 
                 c = COLORS[name]
+                if tid in incident_fired and stop_frames[tid] > 0:
+                    # flashing marker while the suddenly-stopped vehicle stays put
+                    if (frame_idx // int(src_fps / 2 or 1)) % 2 == 0:
+                        cv2.rectangle(frame, (x1 - 6, y1 - 6), (x2 + 6, y2 + 6),
+                                      (0, 0, 255), 3)
+                    cv2.putText(frame, "! INCIDENT?", (x1, y1 - 22),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2,
+                                cv2.LINE_AA)
                 if tid in stationary_now:
                     c = (0, 0, 255)
                     dwell = frame_idx / src_fps - stationary_since.get(tid, 0)
@@ -274,6 +335,7 @@ def main():
         "stationary_vehicles_total": len(stationary_ever),
         "stationary_by_class": dict(Counter(
             track_class[tid] for tid in stationary_ever if tid in track_class)),
+        "incidents_total": incidents_total,
         "events": events,
         "congestion_final": rows[-1]["congestion"] if rows else "n/a",
         "congestion_share": {s: round(sum(r["congestion"] == s for r in rows)

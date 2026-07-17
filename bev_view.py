@@ -35,15 +35,18 @@ FOOTPRINT_M = {"car": (1.8, 4.5), "motorcycle": (0.8, 2.0), "bicycle": (0.8, 2.0
                "truck": (2.4, 7.0), "bus": (2.5, 11.0)}
 
 
-def load_quad(stem: str) -> list[list[float]] | None:
+def load_quad(stem: str) -> tuple[list[list[float]] | None, list[float] | None]:
+    """Return (quad, [width_m, length_m]) for this clip's camera, or (None, None)."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_lines.json")
     if not os.path.exists(path):
-        return None
+        return None, None
     with open(path) as f:
         table = json.load(f)
     keys = [k[:-4] for k in table if k.endswith("_bev")]
     best = max((k for k in keys if stem.startswith(k)), key=len, default=None)
-    return table[best + "_bev"] if best else None
+    if not best:
+        return None, None
+    return table[best + "_bev"], table.get(best + "_bev_size")
 
 
 def median_background(video: str, w: int, h: int, samples: int = 60) -> np.ndarray:
@@ -76,11 +79,16 @@ def main():
     a = ap.parse_args()
 
     stem = os.path.splitext(os.path.basename(a.video))[0]
-    quad = load_quad(stem) if a.quad == "auto" else \
-        np.array([float(v) for v in a.quad.split(",")]).reshape(4, 2).tolist()
+    if a.quad == "auto":
+        quad, size = load_quad(stem)
+        if size:
+            a.width_m, a.length_m = size
+    else:
+        quad = np.array([float(v) for v in a.quad.split(",")]).reshape(4, 2).tolist()
     if quad is None:
         raise SystemExit(f"no BEV quad for {stem}: add '<camera>_bev' to "
                          "camera_lines.json or pass --quad")
+    print(f"BEV quad for {stem}: {a.width_m}x{a.length_m} m", flush=True)
 
     W, Hh = 1280, 720
     src = np.float32(quad) * np.float32([W, Hh])
@@ -102,7 +110,8 @@ def main():
     out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"avc1"),
                           fps, (side_w + bw + 20, bh))
 
-    trails: dict[int, list] = {}
+    trails: dict[int, list] = {}          # tid -> [(px, py)] BEV pixels
+    history: dict[int, list] = {}         # tid -> [(frame, xm, ym)] BEV metres
     fi = 0
     while True:
         if max_frames is not None and fi >= max_frames:
@@ -133,6 +142,22 @@ def main():
                     pts = np.array(trails[tid][-30:], np.int32)
                     if len(pts) > 1:
                         cv2.polylines(bev, [pts], False, c, 1, cv2.LINE_AA)
+                    # speed over a ~1s BEV-metres window (scale approximate
+                    # until the quad is surveyed — labeled as such in the UI)
+                    hist = history.setdefault(tid, [])
+                    hist.append((fi, p[0] / a.ppm, p[1] / a.ppm))
+                    ref = next((h for h in hist if h[0] >= fi - int(fps)), hist[0])
+                    span = (fi - ref[0]) / fps
+                    if span >= 0.6:
+                        dist = ((p[0] / a.ppm - ref[1]) ** 2
+                                + (p[1] / a.ppm - ref[2]) ** 2) ** 0.5
+                        kmh = dist / span * 3.6
+                        if kmh >= 3:
+                            cv2.putText(bev, f"{kmh:.0f}",
+                                        (int(p[0] + fw * a.ppm / 2 + 3), int(p[1] - 4)),
+                                        0, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+                    if len(hist) > int(fps) + 2:
+                        del hist[:len(hist) - int(fps) - 2]
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), c, 2)
         cv2.polylines(frame, [src.astype(np.int32)], True, (0, 255, 255), 2)
         canvas = np.zeros((bh, side_w + bw + 20, 3), np.uint8)

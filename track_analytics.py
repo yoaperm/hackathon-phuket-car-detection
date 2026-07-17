@@ -90,6 +90,54 @@ def load_bev(stem: str):
     return table[best + "_bev"], tuple(table.get(best + "_bev_size", [15, 40]))
 
 
+def median_background(video: str, w: int, h: int, samples: int = 60) -> np.ndarray:
+    """Vehicle-free road estimate: per-pixel median over sampled frames."""
+    cap = cv2.VideoCapture(video)
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frames = []
+    for i in np.linspace(0, n - 1, samples).astype(int):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+        ret, f = cap.read()
+        if ret:
+            frames.append(cv2.resize(f, (w, h)))
+    cap.release()
+    return np.median(np.stack(frames), axis=0).astype(np.uint8)
+
+
+def detect_lane_lines(rect_bg: np.ndarray, bw: int, bh: int) -> list[dict]:
+    """Painted lane lines in a rectified background, as (t_far, t_near)
+    width-fractions. Road markings are near-vertical after IPM, so this is a
+    color-mask + Hough sweep with road-parallel sanity gates."""
+    hsv = cv2.cvtColor(rect_bg, cv2.COLOR_BGR2HSV)
+    masks = {"yellow": cv2.inRange(hsv, np.array((15, 40, 100)), np.array((45, 255, 255))),
+             "white": cv2.inRange(hsv, np.array((0, 0, 160)), np.array((180, 55, 255)))}
+    found = []
+    for kind, m in masks.items():
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((31, 3), np.uint8))
+        lines = cv2.HoughLinesP(m, 1, np.pi / 360, threshold=40,
+                                minLineLength=int(bh * 0.25), maxLineGap=int(bh * 0.2))
+        if lines is None:
+            continue
+        for x1, y1, x2, y2 in lines[:, 0]:
+            L = np.hypot(x2 - x1, y2 - y1)
+            if y1 == y2 or abs(y2 - y1) / (L + 1e-6) < 0.9:
+                continue
+            tf = (x1 + (x2 - x1) * (0 - y1) / (y2 - y1)) / bw
+            tn = (x1 + (x2 - x1) * (bh - y1) / (y2 - y1)) / bw
+            if abs(tf - tn) > 0.12 or not (0.02 <= (tf + tn) / 2 <= 0.98):
+                continue
+            found.append({"t": (tf + tn) / 2, "t_far": round(float(tf), 3),
+                          "t_near": round(float(tn), 3), "kind": kind, "len": L})
+    found.sort(key=lambda f: f["t"])
+    clusters = []
+    for f in found:
+        if clusters and f["t"] - clusters[-1][-1]["t"] < 0.05:
+            clusters[-1].append(f)
+        else:
+            clusters.append([f])
+    return [max(c, key=lambda f: f["len"]) for c in clusters]
+
+
 def congestion_state(mean_active: float) -> str:
     for threshold, name in CONGESTION_LEVELS:
         if mean_active <= threshold:
@@ -181,6 +229,24 @@ def main():
     NM_CLOSING_KMH = 15.0  # relative closing speed
     NM_TTC_S = 1.2         # projected time-to-collision
     bev_hist = defaultdict(lambda: deque(maxlen=int(src_fps) + 2))  # tid->(f,x,y)
+    # Per-lane analytics: detect painted lane lines in the rectified median
+    # background; assign vehicles to lanes by their BEV position.
+    lane_bounds = []
+    track_lane = defaultdict(Counter)   # tid -> lane index votes
+    lane_speeds = defaultdict(list)     # lane -> km/h samples
+    lane_vy = Counter()                 # lane -> sum of along-road velocity
+    if bev_H is not None:
+        print("detecting lane lines from median background…", flush=True)
+        ppm = 18
+        pw, ph = int(bev_wm * ppm), int(bev_lm * ppm)
+        Hpx = cv2.getPerspectiveTransform(
+            bev_src, np.float32([[0, 0], [pw, 0], [pw, ph], [0, ph]]))
+        rect_bg = cv2.warpPerspective(
+            median_background(a.video, out_w, out_h), Hpx, (pw, ph))
+        lane_bounds = [(f["t_far"], f["t_near"], f["kind"])
+                       for f in detect_lane_lines(rect_bg, pw, ph)
+                       if 0.03 < (f["t_far"] + f["t_near"]) / 2 < 0.97]
+        print(f"lane lines: {lane_bounds or 'none detected'}")
     nm_cooldown = {}       # pair -> last fire t
     nm_flash = []          # (until_frame, tid_a, tid_b) — keep annotation visible
     nearmiss_total = 0
@@ -357,6 +423,14 @@ def main():
                     if kmh > 3:            # moving vehicles only
                         frame_speeds.append(kmh)
                         all_speeds.append(kmh)
+                    if lane_bounds:
+                        yf, xf_ = ym / bev_lm, xm / bev_wm
+                        li = sum(xf_ > (b0 + (b1 - b0) * yf)
+                                 for b0, b1, _ in lane_bounds)
+                        track_lane[tid][li] += 1
+                        if kmh > 3:
+                            lane_speeds[li].append(kmh)
+                            lane_vy[li] += vels[tid][1]
             tids = [t for t in bev_now if t in vels]
             for i in range(len(tids)):
                 for j in range(i + 1, len(tids)):
@@ -459,6 +533,18 @@ def main():
         "speed_kmh": {"mean": round(float(np.mean(all_speeds)), 1),
                       "p85": round(float(np.percentile(all_speeds, 85)), 1),
                       "samples": len(all_speeds)} if all_speeds else None,
+        "lane_lines": [{"t_far": b0, "t_near": b1, "kind": k}
+                       for b0, b1, k in lane_bounds] or None,
+        "lanes": [
+            {"lane": li + 1,
+             "unique": sum(1 for tid, votes in track_lane.items()
+                           if votes.most_common(1)[0][0] == li),
+             "mean_kmh": round(float(np.mean(lane_speeds[li])), 1)
+             if lane_speeds[li] else None,
+             "p85_kmh": round(float(np.percentile(lane_speeds[li], 85)), 1)
+             if lane_speeds[li] else None,
+             "direction": "toward camera" if lane_vy[li] > 0 else "away from camera"}
+            for li in range(len(lane_bounds) + 1)] if lane_bounds else None,
         "events": events,
         "congestion_final": rows[-1]["congestion"] if rows else "n/a",
         "congestion_share": {s: round(sum(r["congestion"] == s for r in rows)

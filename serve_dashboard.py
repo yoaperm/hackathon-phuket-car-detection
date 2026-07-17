@@ -68,7 +68,10 @@ CARD = """<div class="card">
 <div class="meta"><h2>{title}</h2><div class="when">{when}</div>
 <div class="kpis">
   <div class="kpi"><b>{unique}</b><span>unique vehicles</span></div>
-  <div class="kpi"><b>{crossings}</b><span>line crossings</span></div>
+  <div class="kpi"><b>{crossings}</b><span>gate crossings</span></div>
+  <div class="kpi"><b>{stationary}</b><span>stationary</span></div>
+  <div class="kpi"><b>{incidents}</b><span>incidents</span></div>
+  <div class="kpi"><b>{nearmiss}</b><span>near-misses</span></div>
   <div class="kpi"><b>{fps:.0f}s</b><span>clip length</span></div>
 </div>
 <div class="classes">{classes}</div>
@@ -96,6 +99,9 @@ def build_page(s3, prefix: str) -> str:
             url=html.escape(url, quote=True), title=html.escape(title),
             when=html.escape(when), unique=data.get("unique_vehicles_total", "?"),
             crossings=flow.get("a_to_b", 0) + flow.get("b_to_a", 0),
+            stationary=data.get("stationary_vehicles_total", 0),
+            incidents=data.get("incidents_total", 0),
+            nearmiss=data.get("nearmiss_total", 0),
             fps=data.get("duration_sec", 0), classes=html.escape(classes)))
     return PAGE.format(bucket=BUCKET, prefix=prefix, cards="".join(cards),
                        model=html.escape(str(model)))

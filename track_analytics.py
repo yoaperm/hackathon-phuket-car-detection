@@ -184,6 +184,7 @@ def main():
     nm_cooldown = {}       # pair -> last fire t
     nm_flash = []          # (until_frame, tid_a, tid_b) — keep annotation visible
     nearmiss_total = 0
+    all_speeds = []        # km/h samples of moving vehicles inside the quad
 
     model = YOLO(a.model)
     classes = vehicle_classes(model)
@@ -341,7 +342,8 @@ def main():
                     cv2.polylines(frame, [pts], False, c, 1, cv2.LINE_AA)
 
         # near-miss pass: pairwise closing-speed / TTC in road-plane metres
-        if bev_H is not None and len(bev_now) >= 2:
+        frame_speeds = []
+        if bev_H is not None and len(bev_now) >= 1:
             t_now = frame_idx / src_fps
             vels = {}
             for tid, (xm, ym, _) in bev_now.items():
@@ -351,6 +353,10 @@ def main():
                 span = (frame_idx - ref[0]) / src_fps
                 if span >= 0.5:
                     vels[tid] = ((xm - ref[1]) / span, (ym - ref[2]) / span)
+                    kmh = (vels[tid][0] ** 2 + vels[tid][1] ** 2) ** 0.5 * 3.6
+                    if kmh > 3:            # moving vehicles only
+                        frame_speeds.append(kmh)
+                        all_speeds.append(kmh)
             tids = [t for t in bev_now if t in vels]
             for i in range(len(tids)):
                 for j in range(i + 1, len(tids)):
@@ -421,6 +427,8 @@ def main():
                      "flow_a_to_b": flow["a_to_b"],
                      "flow_b_to_a": flow["b_to_a"],
                      "stationary_active": len(stationary_now),
+                     "mean_speed_kmh": round(sum(frame_speeds) / len(frame_speeds), 1)
+                     if frame_speeds else "",
                      "congestion": state})
         frame_idx += 1
         if frame_idx % 100 == 0:
@@ -446,6 +454,11 @@ def main():
             track_class[tid] for tid in stationary_ever if tid in track_class)),
         "incidents_total": incidents_total,
         "nearmiss_total": nearmiss_total,
+        # road-plane speeds of moving vehicles inside the calibrated quad;
+        # metric scale approximate until the quad is surveyed
+        "speed_kmh": {"mean": round(float(np.mean(all_speeds)), 1),
+                      "p85": round(float(np.percentile(all_speeds, 85)), 1),
+                      "samples": len(all_speeds)} if all_speeds else None,
         "events": events,
         "congestion_final": rows[-1]["congestion"] if rows else "n/a",
         "congestion_share": {s: round(sum(r["congestion"] == s for r in rows)

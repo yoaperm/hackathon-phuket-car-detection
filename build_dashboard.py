@@ -140,6 +140,7 @@ def main():
         heavy_pct = round(meta["congestion_share"].get("Heavy", 0) * 100)
         flow = meta["line_crossings"]
         state = meta.get("congestion_final", "n/a")
+        spd = round((meta.get("speed_kmh") or {}).get("p85", 0)) or "—"
         state_c = CONGESTION_COLOR.get(state, "#8b96a5")
         cards.append(f"""
     <section class="card">
@@ -153,7 +154,11 @@ def main():
       {f'<img class="shot" src="{img}" alt="annotated frame from {html.escape(label)}">' if img else ""}
       <div class="metrics">
         <div class="metric"><b>{meta["unique_vehicles_total"]}</b><span>unique vehicles</span></div>
-        <div class="metric"><b>{flow["a_to_b"] + flow["b_to_a"]}</b><span>line crossings</span></div>
+        <div class="metric"><b>{flow["a_to_b"] + flow["b_to_a"]}</b><span>gate crossings</span></div>
+        <div class="metric"><b>{meta.get("stationary_vehicles_total", 0)}</b><span>stationary</span></div>
+        <div class="metric"><b>{meta.get("incidents_total", 0)}</b><span>incidents</span></div>
+        <div class="metric"><b>{meta.get("nearmiss_total", 0)}</b><span>near-misses</span></div>
+        <div class="metric"><b>{spd}</b><span>p85 km/h</span></div>
         <div class="metric"><b>{heavy_pct}%</b><span>time heavy</span></div>
       </div>
       {class_bar(meta["unique_vehicles_by_class"], meta["unique_vehicles_total"])}

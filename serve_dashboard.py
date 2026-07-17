@@ -72,6 +72,7 @@ CARD = """<div class="card">
   <div class="kpi"><b>{stationary}</b><span>stationary</span></div>
   <div class="kpi"><b>{incidents}</b><span>incidents</span></div>
   <div class="kpi"><b>{nearmiss}</b><span>near-misses</span></div>
+  <div class="kpi"><b>{p85}</b><span>p85 km/h</span></div>
   <div class="kpi"><b>{fps:.0f}s</b><span>clip length</span></div>
 </div>
 <div class="classes">{classes}</div>
@@ -102,6 +103,7 @@ def build_page(s3, prefix: str) -> str:
             stationary=data.get("stationary_vehicles_total", 0),
             incidents=data.get("incidents_total", 0),
             nearmiss=data.get("nearmiss_total", 0),
+            p85=round((data.get("speed_kmh") or {}).get("p85", 0)) or "—",
             fps=data.get("duration_sec", 0), classes=html.escape(classes)))
     return PAGE.format(bucket=BUCKET, prefix=prefix, cards="".join(cards),
                        model=html.escape(str(model)))

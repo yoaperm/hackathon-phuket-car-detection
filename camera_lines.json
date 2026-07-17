@@ -1,10 +1,10 @@
 {
  "_comment": "Per-camera counting lines as x1,y1,x2,y2 frame fractions, matched to each view's road geometry (picked from gridded reference frames). Keys are clip-stem prefixes; track_analytics.py auto-resolves by longest matching prefix. chalong: diagonal road toward a vanishing point upper-left -> constant-depth cross-section. kathu: wide junction, flow fans from the top mouth -> tilted gate below it. sakhu: main road runs HORIZONTALLY across frame -> vertical gate (the old horizontal default was parallel to traffic and missed nearly everything).",
  "chalong_c1": [
-  0.45,
-  0.62,
-  0.95,
-  0.3
+  0.53,
+  0.75,
+  0.87,
+  0.48
  ],
  "kathu_c10": [
   0.0,
@@ -13,50 +13,50 @@
   0.28
  ],
  "sakhu_c1": [
-  0.5,
-  0.08,
-  0.45,
-  0.72
+  0.63,
+  0.95,
+  0.87,
+  0.36
  ],
  "chalong_c1_bev": [
   [
-   0.372,
-   0.448
+   0.296,
+   0.386
   ],
   [
-   0.585,
-   0.302
+   0.356,
+   0.319
   ],
   [
-   0.965,
-   0.425
+   0.949,
+   0.495
   ],
   [
-   0.489,
-   0.672
+   0.649,
+   0.905
   ]
  ],
  "sakhu_c1_bev": [
   [
-   0.13,
-   0.135
+   0.187,
+   0.128
   ],
   [
-   0.6,
-   0.19
+   0.123,
+   0.256
   ],
   [
-   0.52,
-   0.575
+   0.548,
+   0.856
   ],
   [
-   0.05,
-   0.385
+   0.716,
+   0.203
   ]
  ],
  "sakhu_c1_bev_size": [
-  15,
-  50
+  18,
+  65
  ],
  "kathu_c10_bev": [
   [
@@ -81,7 +81,7 @@
   35
  ],
  "chalong_c1_bev_size": [
-  15,
-  40
+  16,
+  60
  ]
 }

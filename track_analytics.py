@@ -70,6 +70,26 @@ def resolve_line(spec: str, stem: str) -> list[float]:
     return [0, 0.55, 1, 0.55]
 
 
+def load_bev(stem: str):
+    """(quad fractions, (width_m, length_m)) for this camera, or None.
+
+    The '<camera>_bev' quad in camera_lines.json maps the road plane to a
+    metric rectangle. Scale is anchored to assumed road dimensions until the
+    quad is surveyed — downstream copy says so.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "camera_lines.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        table = json.load(f)
+    keys = [k[:-4] for k in table if k.endswith("_bev")]
+    best = max((k for k in keys if stem.startswith(k)), key=len, default=None)
+    if not best:
+        return None
+    return table[best + "_bev"], tuple(table.get(best + "_bev_size", [15, 40]))
+
+
 def congestion_state(mean_active: float) -> str:
     for threshold, name in CONGESTION_LEVELS:
         if mean_active <= threshold:
@@ -145,6 +165,26 @@ def main():
     incident_fired = {}               # track id -> (t, center) of its incident
     incidents_total = 0
 
+    # Near-miss detection in road-plane metres (needs a BEV quad). Two
+    # vehicles closing fast at short range → surrogate-safety event (TTC
+    # style). Thresholds are conservative because Thai mixed traffic follows
+    # closely: requires genuine closing speed, not just proximity.
+    bev_cfg = load_bev(stem)
+    bev_H = None
+    if bev_cfg:
+        quad, (bev_wm, bev_lm) = bev_cfg
+        bev_src = np.float32(quad) * np.float32([out_w, out_h])
+        bev_dst = np.float32([[0, 0], [bev_wm, 0], [bev_wm, bev_lm], [0, bev_lm]])
+        bev_H = cv2.getPerspectiveTransform(bev_src, bev_dst)  # image px -> metres
+        print(f"near-miss detector on: BEV quad {bev_wm}x{bev_lm} m")
+    NM_DIST_M = 2.5        # centre distance at closest approach
+    NM_CLOSING_KMH = 15.0  # relative closing speed
+    NM_TTC_S = 1.2         # projected time-to-collision
+    bev_hist = defaultdict(lambda: deque(maxlen=int(src_fps) + 2))  # tid->(f,x,y)
+    nm_cooldown = {}       # pair -> last fire t
+    nm_flash = []          # (until_frame, tid_a, tid_b) — keep annotation visible
+    nearmiss_total = 0
+
     model = YOLO(a.model)
     classes = vehicle_classes(model)
     out_mp4 = os.path.join(a.out_dir, f"{stem}_tracked.mp4")
@@ -179,6 +219,7 @@ def main():
                         imgsz=a.imgsz, verbose=False)[0]
 
         active = 0
+        bev_now = {}   # tid -> (xm, ym, name) this frame, for the near-miss pass
         if r.boxes.id is not None:
             ids = r.boxes.id.int().tolist()
             clss = r.boxes.cls.int().tolist()
@@ -197,6 +238,16 @@ def main():
                 t_now = frame_idx / src_fps
                 pos = positions[tid]
                 pos.append((frame_idx, center))
+
+                if bev_H is not None:
+                    gx, gy = (x1 + x2) / 2, y2   # ground-contact point
+                    m = cv2.perspectiveTransform(
+                        np.float32([[[gx, gy]]]), bev_H)[0][0]
+                    # only inside the calibrated quad (+2 m margin): outside it
+                    # the plane extrapolation degrades and fakes closings
+                    if -2 <= m[0] <= bev_wm + 2 and -2 <= m[1] <= bev_lm + 2:
+                        bev_hist[tid].append((frame_idx, float(m[0]), float(m[1])))
+                        bev_now[tid] = (float(m[0]), float(m[1]), name)
 
                 # ~1s-lookback speed for the incident detector
                 if a.stationary_secs > 0:
@@ -289,6 +340,64 @@ def main():
                 if len(pts) > 1:
                     cv2.polylines(frame, [pts], False, c, 1, cv2.LINE_AA)
 
+        # near-miss pass: pairwise closing-speed / TTC in road-plane metres
+        if bev_H is not None and len(bev_now) >= 2:
+            t_now = frame_idx / src_fps
+            vels = {}
+            for tid, (xm, ym, _) in bev_now.items():
+                h = bev_hist[tid]
+                ref = next((e for e in h if e[0] >= frame_idx - int(src_fps * 0.8)),
+                           h[0])
+                span = (frame_idx - ref[0]) / src_fps
+                if span >= 0.5:
+                    vels[tid] = ((xm - ref[1]) / span, (ym - ref[2]) / span)
+            tids = [t for t in bev_now if t in vels]
+            for i in range(len(tids)):
+                for j in range(i + 1, len(tids)):
+                    ta, tb = tids[i], tids[j]
+                    ax, ay, an = bev_now[ta]
+                    bx, by, bn = bev_now[tb]
+                    dx, dy = bx - ax, by - ay
+                    dist = (dx * dx + dy * dy) ** 0.5
+                    if dist > 12 or dist < 1e-6:
+                        continue
+                    rvx = vels[tb][0] - vels[ta][0]
+                    rvy = vels[tb][1] - vels[ta][1]
+                    closing = -(dx * rvx + dy * rvy) / dist   # m/s, >0 approaching
+                    if closing * 3.6 < NM_CLOSING_KMH:
+                        continue
+                    ttc = dist / closing
+                    # predicted miss distance at closest approach under linear
+                    # motion — filters opposing streams that pass a lane apart
+                    rv = (rvx * rvx + rvy * rvy) ** 0.5
+                    along = abs(dx * rvx + dy * rvy) / max(rv, 1e-6)
+                    d_miss = max(dist * dist - along * along, 0.0) ** 0.5
+                    danger_now = dist < NM_DIST_M and closing * 3.6 >= NM_CLOSING_KMH
+                    danger_pred = ttc < NM_TTC_S and d_miss < 1.2 and dist < 10.0
+                    if not (danger_now or danger_pred):
+                        continue
+                    pair = (min(ta, tb), max(ta, tb))
+                    if t_now - nm_cooldown.get(pair, -99) < 5.0:
+                        continue
+                    nm_cooldown[pair] = t_now
+                    nearmiss_total += 1
+                    events.append({
+                        "t": round(t_now, 1), "type": "nearmiss",
+                        "severity": "alert",
+                        "msg": f"Near-miss signature: {an} #{ta} & {bn} #{tb} — "
+                               f"{dist:.1f} m apart, closing {closing * 3.6:.0f} km/h "
+                               f"(TTC {ttc:.1f}s)"})
+                    nm_flash.append((frame_idx + int(1.5 * src_fps), ta, tb))
+            nm_flash = [f for f in nm_flash if f[0] >= frame_idx]
+            for _, ta, tb in nm_flash:
+                if ta in bev_now and tb in bev_now:
+                    pa, pb = trails[ta][-1], trails[tb][-1]
+                    cv2.line(frame, pa, pb, (0, 200, 255), 3)
+                    mid = ((pa[0] + pb[0]) // 2, (pa[1] + pb[1]) // 2)
+                    cv2.putText(frame, "NEAR MISS", (mid[0] - 40, mid[1] - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2,
+                                cv2.LINE_AA)
+
         active_window.append(active)
         mean_active = sum(active_window) / len(active_window)
         state = congestion_state(mean_active)
@@ -336,6 +445,7 @@ def main():
         "stationary_by_class": dict(Counter(
             track_class[tid] for tid in stationary_ever if tid in track_class)),
         "incidents_total": incidents_total,
+        "nearmiss_total": nearmiss_total,
         "events": events,
         "congestion_final": rows[-1]["congestion"] if rows else "n/a",
         "congestion_share": {s: round(sum(r["congestion"] == s for r in rows)

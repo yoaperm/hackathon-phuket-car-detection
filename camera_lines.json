@@ -83,5 +83,7 @@
  "chalong_c1_bev_size": [
   16,
   60
- ]
+ ],
+ "chalong_c1_bev_split": 0.5,
+ "sakhu_c1_bev_split": 0.5
 }

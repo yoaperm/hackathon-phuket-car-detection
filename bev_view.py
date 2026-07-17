@@ -35,18 +35,19 @@ FOOTPRINT_M = {"car": (1.8, 4.5), "motorcycle": (0.8, 2.0), "bicycle": (0.8, 2.0
                "truck": (2.4, 7.0), "bus": (2.5, 11.0)}
 
 
-def load_quad(stem: str) -> tuple[list[list[float]] | None, list[float] | None]:
-    """Return (quad, [width_m, length_m]) for this clip's camera, or (None, None)."""
+def load_quad(stem: str):
+    """(quad, [width_m, length_m], lane-split fraction) for this camera."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_lines.json")
     if not os.path.exists(path):
-        return None, None
+        return None, None, None
     with open(path) as f:
         table = json.load(f)
     keys = [k[:-4] for k in table if k.endswith("_bev")]
     best = max((k for k in keys if stem.startswith(k)), key=len, default=None)
     if not best:
-        return None, None
-    return table[best + "_bev"], table.get(best + "_bev_size")
+        return None, None, None
+    return (table[best + "_bev"], table.get(best + "_bev_size"),
+            table.get(best + "_bev_split"))
 
 
 def median_background(video: str, w: int, h: int, samples: int = 60) -> np.ndarray:
@@ -79,8 +80,9 @@ def main():
     a = ap.parse_args()
 
     stem = os.path.splitext(os.path.basename(a.video))[0]
+    split = None
     if a.quad == "auto":
-        quad, size = load_quad(stem)
+        quad, size, split = load_quad(stem)
         if size:
             a.width_m, a.length_m = size
     else:
@@ -88,7 +90,8 @@ def main():
     if quad is None:
         raise SystemExit(f"no BEV quad for {stem}: add '<camera>_bev' to "
                          "camera_lines.json or pass --quad")
-    print(f"BEV quad for {stem}: {a.width_m}x{a.length_m} m", flush=True)
+    print(f"BEV quad for {stem}: {a.width_m}x{a.length_m} m"
+          + (f", lane split at {split}" if split else ""), flush=True)
 
     W, Hh = 1280, 720
     src = np.float32(quad) * np.float32([W, Hh])
@@ -96,8 +99,47 @@ def main():
     dst = np.float32([[0, 0], [bw, 0], [bw, bh], [0, bh]])
     Hm = cv2.getPerspectiveTransform(src, dst)
 
+    # Lane-split mode: one homography per lane, split at the quad midline.
+    # The wide-angle lens distorts the frame edges, so a single plane fit
+    # cannot serve both lanes; two local fits absorb the distortion and are
+    # composited along the shared centre seam.
+    halves = None
+    if split:
+        A, B, C, D = src            # far-left, far-right, near-right, near-left
+        mid_far = A + (B - A) * split
+        mid_near = D + (C - D) * split
+        sw = int(bw * split)
+        srcL = np.float32([A, mid_far, mid_near, D])
+        dstL = np.float32([[0, 0], [sw, 0], [sw, bh], [0, bh]])
+        srcR = np.float32([mid_far, B, C, mid_near])
+        dstR = np.float32([[sw, 0], [bw, 0], [bw, bh], [sw, bh]])
+        HL = cv2.getPerspectiveTransform(srcL, dstL)
+        HR = cv2.getPerspectiveTransform(srcR, dstR)
+        quadL = srcL.reshape(-1, 1, 2)
+        quadR = srcR.reshape(-1, 1, 2)
+        halves = (HL, HR, quadL, quadR, sw)
+
+    def warp_bev(image):
+        if halves is None:
+            return cv2.warpPerspective(image, Hm, (bw, bh))
+        HL, HR, _, _, sw = halves
+        out = cv2.warpPerspective(image, HR, (bw, bh))
+        out[:, :sw] = cv2.warpPerspective(image, HL, (bw, bh))[:, :sw]
+        return out
+
+    def project(pt):
+        """Ground point -> BEV pixels via the homography owning that lane."""
+        p = np.float32([[pt]])
+        if halves is not None:
+            HL, HR, quadL, quadR, _ = halves
+            if cv2.pointPolygonTest(quadL, pt, False) >= 0:
+                return cv2.perspectiveTransform(p, HL)[0][0]
+            if cv2.pointPolygonTest(quadR, pt, False) >= 0:
+                return cv2.perspectiveTransform(p, HR)[0][0]
+        return cv2.perspectiveTransform(p, Hm)[0][0]
+
     print("building median background (vehicle-free base map)…", flush=True)
-    base = cv2.warpPerspective(median_background(a.video, W, Hh), Hm, (bw, bh))
+    base = warp_bev(median_background(a.video, W, Hh))
 
     model = YOLO(a.model)
     classes = vehicle_classes(model)
@@ -130,8 +172,7 @@ def main():
                                      r.boxes.cls.int().tolist()):
                 x1, y1, x2, y2 = box
                 name = classes[cls]
-                p = cv2.perspectiveTransform(
-                    np.float32([[[(x1 + x2) / 2, y2]]]), Hm)[0][0]
+                p = project(((x1 + x2) / 2, y2))
                 c = BGR.get(name, (0, 255, 0))
                 if -20 <= p[0] <= bw + 20 and -20 <= p[1] <= bh + 20:
                     fw, fl = FOOTPRINT_M.get(name, (1.8, 4.5))

@@ -74,6 +74,9 @@ def main():
     ap.add_argument("--width-m", type=float, default=15, help="road-quad width (m)")
     ap.add_argument("--length-m", type=float, default=40, help="road-quad length (m)")
     ap.add_argument("--ppm", type=float, default=18, help="BEV pixels per metre")
+    ap.add_argument("--auto-split", action="store_true",
+                    help="detect the painted lane divider in the rectified "
+                         "background and split the BEV there")
     ap.add_argument("--quad", default="auto",
                     help="'auto' (camera_lines.json <camera>_bev) or 8 comma-separated "
                          "fractions: far-left x,y, far-right x,y, near-right x,y, near-left x,y")
@@ -99,32 +102,39 @@ def main():
     dst = np.float32([[0, 0], [bw, 0], [bw, bh], [0, bh]])
     Hm = cv2.getPerspectiveTransform(src, dst)
 
-    # Lane-split mode: one homography per lane, split at the quad midline.
-    # The wide-angle lens distorts the frame edges, so a single plane fit
-    # cannot serve both lanes; two local fits absorb the distortion and are
-    # composited along the shared centre seam.
+    # Lane-split mode: one homography per lane, composited along the lane
+    # divider. The wide-angle lens distorts the frame edges, so a single
+    # plane fit cannot serve both lanes; two local fits absorb the
+    # distortion. The divider is (t_far, t_near) fractions along the quad's
+    # far and near width edges — a single number means an even split.
     halves = None
-    if split:
+
+    def make_halves(t_far, t_near):
         A, B, C, D = src            # far-left, far-right, near-right, near-left
-        mid_far = A + (B - A) * split
-        mid_near = D + (C - D) * split
-        sw = int(bw * split)
+        mid_far = A + (B - A) * t_far
+        mid_near = D + (C - D) * t_near
+        sxf, sxn = bw * t_far, bw * t_near
         srcL = np.float32([A, mid_far, mid_near, D])
-        dstL = np.float32([[0, 0], [sw, 0], [sw, bh], [0, bh]])
+        dstL = np.float32([[0, 0], [sxf, 0], [sxn, bh], [0, bh]])
         srcR = np.float32([mid_far, B, C, mid_near])
-        dstR = np.float32([[sw, 0], [bw, 0], [bw, bh], [sw, bh]])
+        dstR = np.float32([[sxf, 0], [bw, 0], [bw, bh], [sxn, bh]])
         HL = cv2.getPerspectiveTransform(srcL, dstL)
         HR = cv2.getPerspectiveTransform(srcR, dstR)
-        quadL = srcL.reshape(-1, 1, 2)
-        quadR = srcR.reshape(-1, 1, 2)
-        halves = (HL, HR, quadL, quadR, sw)
+        maskL = np.zeros((bh, bw), np.uint8)
+        cv2.fillPoly(maskL, [dstL.astype(np.int32)], 255)
+        return (HL, HR, srcL.reshape(-1, 1, 2), srcR.reshape(-1, 1, 2), maskL)
+
+    if split:
+        tf, tn = (split, split) if isinstance(split, (int, float)) else split
+        halves = make_halves(tf, tn)
 
     def warp_bev(image):
         if halves is None:
             return cv2.warpPerspective(image, Hm, (bw, bh))
-        HL, HR, _, _, sw = halves
+        HL, HR, _, _, maskL = halves
         out = cv2.warpPerspective(image, HR, (bw, bh))
-        out[:, :sw] = cv2.warpPerspective(image, HL, (bw, bh))[:, :sw]
+        left = cv2.warpPerspective(image, HL, (bw, bh))
+        out[maskL > 0] = left[maskL > 0]
         return out
 
     def project(pt):
@@ -139,7 +149,47 @@ def main():
         return cv2.perspectiveTransform(p, Hm)[0][0]
 
     print("building median background (vehicle-free base map)…", flush=True)
-    base = warp_bev(median_background(a.video, W, Hh))
+    bg = median_background(a.video, W, Hh)
+
+    if a.auto_split:
+        # Detect the painted lane divider automatically: in the rectified
+        # (single-H) background, road markings become near-vertical lines.
+        # Find the strongest long, near-vertical yellow-paint line and use
+        # it as the seam.
+        rect = cv2.warpPerspective(bg, Hm, (bw, bh))
+        hsv = cv2.cvtColor(rect, cv2.COLOR_BGR2HSV)
+        paint = cv2.inRange(hsv, np.array((15, 40, 100)), np.array((45, 255, 255)))
+        paint = cv2.morphologyEx(paint, cv2.MORPH_CLOSE, np.ones((9, 3), np.uint8))
+        lines = cv2.HoughLinesP(paint, 1, np.pi / 360, threshold=40,
+                                minLineLength=int(bh * 0.35),
+                                maxLineGap=int(bh * 0.15))
+        best, score = None, 0
+        if lines is not None:
+            for x1, y1, x2, y2 in lines[:, 0]:
+                length = np.hypot(x2 - x1, y2 - y1)
+                vert = abs(y2 - y1) / (length + 1e-6)
+                if vert > 0.9 and length * vert > score:
+                    best, score = (x1, y1, x2, y2), length * vert
+        ok = False
+        if best is not None:
+            x1, y1, x2, y2 = best
+            xf = x1 + (x2 - x1) * (0 - y1) / (y2 - y1)
+            xn = x1 + (x2 - x1) * (bh - y1) / (y2 - y1)
+            tf, tn = round(float(xf / bw), 3), round(float(xn / bw), 3)
+            # a real centre line parallels the road axis (t ~ constant) and
+            # sits away from the kerbs — rejects kerb streaks / sand washes
+            ok = abs(tf - tn) <= 0.1 and 0.15 <= (tf + tn) / 2 <= 0.85
+            if ok:
+                print(f"auto-split: divider at far t={tf}, near t={tn} "
+                      f"(persist as \"<camera>_bev_split\": [{tf}, {tn}])")
+                halves = make_halves(tf, tn)
+            else:
+                print(f"auto-split: candidate ({tf},{tn}) rejected by sanity "
+                      "gate (not road-parallel or too near a kerb)")
+        if not ok:
+            print("auto-split: no confident lane divider; keeping configured split")
+
+    base = warp_bev(bg)
 
     model = YOLO(a.model)
     classes = vehicle_classes(model)

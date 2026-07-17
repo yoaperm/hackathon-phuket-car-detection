@@ -84,6 +84,9 @@
   16,
   60
  ],
- "chalong_c1_bev_split": 0.5,
+ "chalong_c1_bev_split": [
+  0.717,
+  0.749
+ ],
  "sakhu_c1_bev_split": 0.5
 }
